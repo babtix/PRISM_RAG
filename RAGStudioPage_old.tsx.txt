@@ -1,0 +1,726 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { api } from '../../lib/api';
+import { toast } from 'sonner';
+import { Button } from '../../components/ui/Button';
+import {
+  Cpu,
+  Plus,
+  FileText,
+  Trash2,
+  Edit2,
+  UploadCloud,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  X,
+  Database,
+  AtSign,
+  ChevronLeft,
+  Package,
+  Hash,
+  Palette,
+  Sparkles,
+  Settings,
+} from 'lucide-react';
+import { cn } from '../../lib/utils';
+import type { RAGModuleResponse, RAGDocumentResponse } from '@medcore/shared';
+
+// ── Module Form State ────────────────────────────────────────────────────────
+
+interface ModuleFormData {
+  name: string;
+  slug: string;
+  description: string;
+  system_prompt: string;
+  icon: string;
+  color: string;
+}
+
+const DEFAULT_FORM: ModuleFormData = {
+  name: '',
+  slug: '',
+  description: '',
+  system_prompt: '',
+  icon: 'Book',
+  color: '#7132F5',
+};
+
+const MODULE_ICONS = ['Book', 'Heart', 'Brain', 'Pill', 'Bone', 'Microscope', 'Dna', 'Stethoscope', 'Hospital', 'Flask', 'Syringe', 'XRay', 'Lungs', 'Eye', 'Tooth'];
+const MODULE_COLORS = ['#7132F5', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#ef4444', '#06b6d4', '#84cc16'];
+
+// ── Main RAG Studio Page ─────────────────────────────────────────────────────
+
+export const RAGStudioPage = () => {
+  const [modules, setModules] = useState<RAGModuleResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [editingModule, setEditingModule] = useState<RAGModuleResponse | null>(null);
+  const [selectedModule, setSelectedModule] = useState<RAGModuleResponse | null>(null);
+  const [form, setForm] = useState<ModuleFormData>(DEFAULT_FORM);
+  const [saving, setSaving] = useState(false);
+
+  // Document state (when viewing a module)
+  const [documents, setDocuments] = useState<RAGDocumentResponse[]>([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  // ── Fetch ──────────────────────────────────────────────────────────────
+
+  const fetchModules = useCallback(async () => {
+    try {
+      setLoading(true);
+      const res = await api.get<RAGModuleResponse[]>('/admin/rag-studio/modules');
+      setModules(res.data);
+    } catch {
+      toast.error('Failed to load modules');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchDocuments = useCallback(async (moduleId: string) => {
+    try {
+      setDocsLoading(true);
+      const res = await api.get<RAGDocumentResponse[]>(`/admin/rag-studio/modules/${moduleId}/documents`);
+      setDocuments(res.data);
+    } catch {
+      toast.error('Failed to load documents');
+    } finally {
+      setDocsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchModules();
+  }, [fetchModules]);
+
+  useEffect(() => {
+    if (selectedModule) {
+      fetchDocuments(selectedModule.id);
+      // Poll for processing status every 5 seconds
+      const interval = setInterval(() => {
+        fetchDocuments(selectedModule.id);
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [selectedModule, fetchDocuments]);
+
+  // ── Module CRUD ────────────────────────────────────────────────────────
+
+  const handleCreateModule = async () => {
+    if (!form.name.trim()) {
+      toast.error('Module name is required');
+      return;
+    }
+    setSaving(true);
+    try {
+      const slug = form.slug.trim() || form.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      await api.post('/admin/rag-studio/modules', {
+        ...form,
+        slug,
+      });
+      toast.success('Module created');
+      setShowCreateForm(false);
+      setForm(DEFAULT_FORM);
+      fetchModules();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'Failed to create module');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleUpdateModule = async () => {
+    if (!editingModule) return;
+    setSaving(true);
+    try {
+      await api.patch(`/admin/rag-studio/modules/${editingModule.id}`, form);
+      toast.success('Module updated');
+      setEditingModule(null);
+      setForm(DEFAULT_FORM);
+      fetchModules();
+      // If viewing this module, refresh
+      if (selectedModule?.id === editingModule.id) {
+        const res = await api.get<RAGModuleResponse[]>('/admin/rag-studio/modules');
+        const updated = res.data.find((m) => m.id === editingModule.id);
+        if (updated) setSelectedModule(updated);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'Failed to update module');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteModule = async (mod: RAGModuleResponse) => {
+    if (!confirm(`Delete "${mod.name}" and all its documents? This cannot be undone.`)) return;
+    try {
+      await api.delete(`/admin/rag-studio/modules/${mod.id}`);
+      toast.success('Module deleted');
+      if (selectedModule?.id === mod.id) setSelectedModule(null);
+      fetchModules();
+    } catch {
+      toast.error('Failed to delete module');
+    }
+  };
+
+  // ── Document Upload ────────────────────────────────────────────────────
+
+  const handleUploadDocument = async () => {
+    if (!uploadFile || !selectedModule) return;
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', uploadFile);
+      await api.post(`/admin/rag-studio/modules/${selectedModule.id}/documents`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      toast.success('PDF uploaded — processing started');
+      setUploadFile(null);
+      fetchDocuments(selectedModule.id);
+      // Refresh module stats after a delay
+      setTimeout(fetchModules, 3000);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'Upload failed');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDeleteDocument = async (docId: string) => {
+    if (!selectedModule) return;
+    try {
+      await api.delete(`/admin/rag-studio/modules/${selectedModule.id}/documents/${docId}`);
+      toast.success('Document deleted');
+      fetchDocuments(selectedModule.id);
+      fetchModules();
+    } catch {
+      toast.error('Failed to delete document');
+    }
+  };
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files?.[0]) {
+      const file = e.dataTransfer.files[0];
+      if (file.type === 'application/pdf') {
+        setUploadFile(file);
+      } else {
+        toast.error('Only PDF files are allowed');
+      }
+    }
+  }, []);
+
+  // ── Edit Mode ──────────────────────────────────────────────────────────
+
+  const startEdit = (mod: RAGModuleResponse) => {
+    setEditingModule(mod);
+    setForm({
+      name: mod.name,
+      slug: mod.slug,
+      description: mod.description || '',
+      system_prompt: mod.system_prompt || '',
+      icon: mod.icon,
+      color: mod.color,
+    });
+  };
+
+  // ── Module Detail View ─────────────────────────────────────────────────
+
+  if (selectedModule) {
+    return (
+      <div className="space-y-6 animate-fade-in">
+        {/* Back + Header */}
+        <div>
+          <button
+            onClick={() => setSelectedModule(null)}
+            className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-3"
+          >
+            <ChevronLeft className="h-4 w-4" />
+            Back to modules
+          </button>
+          <div className="flex items-center gap-3">
+            <div
+              className="w-12 h-12 rounded-2xl flex items-center justify-center text-xl"
+              style={{ background: `${selectedModule.color}18` }}
+            >
+              {selectedModule.icon}
+            </div>
+            <div className="flex-1">
+              <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center gap-2">
+                {selectedModule.name}
+              </h1>
+              <p className="text-sm text-muted-foreground mt-0.5 flex items-center gap-2">
+                <span className="font-mono text-xs px-2 py-0.5 rounded-md bg-muted" style={{ color: selectedModule.color }}>
+                  @{selectedModule.slug}
+                </span>
+                <span>·</span>
+                <span>{selectedModule.document_count} documents</span>
+                <span>·</span>
+                <span>{selectedModule.chunk_count} chunks</span>
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => startEdit(selectedModule)}
+                className="h-9 px-3 rounded-xl border border-border hover:bg-muted text-sm font-semibold flex items-center gap-1.5 transition-colors"
+              >
+                <Settings className="h-3.5 w-3.5" />
+                Settings
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Upload Zone */}
+        <div
+          onDrop={handleDrop}
+          onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+          onDragLeave={(e) => { e.preventDefault(); setIsDragOver(false); }}
+          className={cn(
+            'border-2 border-dashed rounded-2xl p-8 text-center transition-all',
+            isDragOver
+              ? 'border-primary bg-primary/5 scale-[1.01]'
+              : 'border-border bg-card/50 hover:border-muted-foreground/30'
+          )}
+        >
+          <div className={cn(
+            'w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-all',
+            isDragOver ? 'bg-primary/15 scale-110' : 'bg-muted'
+          )}>
+            <UploadCloud className={cn(
+              'h-7 w-7 transition-colors',
+              isDragOver ? 'text-primary' : 'text-muted-foreground'
+            )} />
+          </div>
+
+          <h3 className="text-base font-bold text-foreground mb-1">
+            {isDragOver ? 'Drop your PDF here' : 'Upload PDF to this module'}
+          </h3>
+          <p className="text-sm text-muted-foreground mb-4">
+            Drag & drop or click to browse. Files are automatically processed and indexed.
+          </p>
+
+          <input
+            type="file"
+            accept="application/pdf"
+            className="hidden"
+            id="module-pdf-upload"
+            onChange={(e) => {
+              if (e.target.files?.[0]) setUploadFile(e.target.files[0]);
+            }}
+          />
+          <label
+            htmlFor="module-pdf-upload"
+            className="inline-flex items-center px-4 py-2.5 bg-primary text-white rounded-xl font-semibold text-sm cursor-pointer hover:bg-primary/90 transition-all shadow-sm"
+          >
+            <UploadCloud className="mr-2 h-4 w-4" />
+            Select PDF
+          </label>
+        </div>
+
+        {/* Selected file preview */}
+        {uploadFile && (
+          <div className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-card animate-slide-up">
+            <div className="w-10 h-10 rounded-xl bg-red-500/10 flex items-center justify-center shrink-0">
+              <FileText className="h-5 w-5 text-red-500" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-sm text-foreground truncate">{uploadFile.name}</p>
+              <p className="text-xs text-muted-foreground">{(uploadFile.size / 1024 / 1024).toFixed(2)} MB</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setUploadFile(null)}
+                className="p-2 rounded-lg hover:bg-rose-500/10 text-muted-foreground hover:text-rose-500 transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+              <Button
+                onClick={handleUploadDocument}
+                disabled={uploading}
+                variant="primary"
+                size="sm"
+              >
+                {uploading ? (
+                  <>
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    Processing…
+                  </>
+                ) : (
+                  'Upload & Index'
+                )}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Documents List */}
+        <div>
+          <h2 className="text-sm font-bold uppercase tracking-widest text-muted-foreground mb-3 flex items-center gap-2">
+            <FileText className="h-3.5 w-3.5" />
+            Documents ({documents.length})
+          </h2>
+
+          {docsLoading && documents.length === 0 ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-5 w-5 animate-spin text-primary" />
+            </div>
+          ) : documents.length === 0 ? (
+            <div className="py-12 text-center rounded-2xl border border-dashed border-border bg-card/50">
+              <FileText className="h-8 w-8 text-muted-foreground/40 mx-auto mb-3" />
+              <p className="text-sm font-semibold text-foreground">No documents yet</p>
+              <p className="text-xs text-muted-foreground mt-1">Upload PDFs above to start building this module's knowledge base</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {documents.map((doc) => (
+                <div
+                  key={doc.id}
+                  className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-card hover:shadow-sm transition-all"
+                >
+                  <div className={cn(
+                    'w-10 h-10 rounded-xl flex items-center justify-center shrink-0',
+                    doc.status === 'ready' ? 'bg-emerald-500/10' :
+                    doc.status === 'failed' ? 'bg-red-500/10' :
+                    'bg-amber-500/10'
+                  )}>
+                    {doc.status === 'ready' ? (
+                      <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+                    ) : doc.status === 'failed' ? (
+                      <AlertCircle className="h-5 w-5 text-red-500" />
+                    ) : (
+                      <Loader2 className="h-5 w-5 text-amber-500 animate-spin" />
+                    )}
+                  </div>
+
+                  <div className="flex-1 min-w-0">
+                    <p className="font-semibold text-sm text-foreground truncate">{doc.filename}</p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className={cn(
+                        'text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-md',
+                        doc.status === 'ready' ? 'bg-emerald-500/10 text-emerald-500' :
+                        doc.status === 'failed' ? 'bg-red-500/10 text-red-500' :
+                        'bg-amber-500/10 text-amber-500'
+                      )}>
+                        {doc.status}
+                      </span>
+                      {doc.page_count != null && (
+                        <span className="text-xs text-muted-foreground">{doc.page_count} pages</span>
+                      )}
+                      {doc.chunk_count != null && (
+                        <span className="text-xs text-muted-foreground">· {doc.chunk_count} chunks</span>
+                      )}
+                    </div>
+                    {doc.error_message && (
+                      <p className="text-xs text-red-500 mt-1 truncate">{doc.error_message}</p>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={() => handleDeleteDocument(doc.id)}
+                    className="p-2 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors shrink-0"
+                    title="Delete document"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Module Form (Create/Edit) ──────────────────────────────────────────
+
+  const formView = (showCreateForm || editingModule) && (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-fade-in p-4">
+      <div className="bg-card border border-border rounded-3xl shadow-elevated w-full max-w-lg max-h-[90vh] overflow-y-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 pt-6 pb-4 border-b border-border">
+          <h2 className="text-lg font-bold text-foreground">
+            {editingModule ? 'Edit Module' : 'Create New Module'}
+          </h2>
+          <button
+            onClick={() => { setShowCreateForm(false); setEditingModule(null); setForm(DEFAULT_FORM); }}
+            className="p-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Form */}
+        <div className="px-6 py-5 space-y-5">
+          {/* Name */}
+          <div>
+            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5 flex items-center gap-1.5">
+              <Package className="h-3 w-3" /> Module Name
+            </label>
+            <input
+              type="text"
+              value={form.name}
+              onChange={(e) => {
+                setForm((f) => ({
+                  ...f,
+                  name: e.target.value,
+                  slug: editingModule ? f.slug : e.target.value.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''),
+                }));
+              }}
+              placeholder="e.g. Cardiology Guidelines"
+              className="w-full px-4 py-2.5 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary transition-shadow"
+            />
+          </div>
+
+          {/* Slug */}
+          <div>
+            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5 flex items-center gap-1.5">
+              <Hash className="h-3 w-3" /> @slug (for chat mentions)
+            </label>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm font-bold">@</span>
+              <input
+                type="text"
+                value={form.slug}
+                onChange={(e) => setForm((f) => ({ ...f, slug: e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '') }))}
+                placeholder="cardiology_guidelines"
+                className="w-full pl-7 pr-4 py-2.5 rounded-xl border border-border bg-background text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary transition-shadow"
+              />
+            </div>
+          </div>
+
+          {/* Description */}
+          <div>
+            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5 block">
+              Description
+            </label>
+            <textarea
+              value={form.description}
+              onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+              placeholder="What this module covers..."
+              rows={2}
+              className="w-full px-4 py-2.5 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary resize-none transition-shadow"
+            />
+          </div>
+
+          {/* Icon Picker */}
+          <div>
+            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5 block">
+              Icon
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {MODULE_ICONS.map((icon) => (
+                <button
+                  key={icon}
+                  onClick={() => setForm((f) => ({ ...f, icon }))}
+                  className={cn(
+                    'w-10 h-10 rounded-xl text-lg flex items-center justify-center border-2 transition-all hover:scale-110',
+                    form.icon === icon
+                      ? 'border-primary bg-primary/10 shadow-sm'
+                      : 'border-border bg-card hover:border-muted-foreground/30'
+                  )}
+                >
+                  {icon}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Color Picker */}
+          <div>
+            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5 flex items-center gap-1.5">
+              <Palette className="h-3 w-3" /> Badge Color
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {MODULE_COLORS.map((color) => (
+                <button
+                  key={color}
+                  onClick={() => setForm((f) => ({ ...f, color }))}
+                  className={cn(
+                    'w-8 h-8 rounded-full transition-all hover:scale-110 border-2',
+                    form.color === color
+                      ? 'border-foreground scale-110 shadow-sm'
+                      : 'border-transparent'
+                  )}
+                  style={{ background: color }}
+                />
+              ))}
+            </div>
+          </div>
+
+          {/* System Prompt (Advanced) */}
+          <details className="group">
+            <summary className="cursor-pointer text-xs font-bold uppercase tracking-widest text-muted-foreground flex items-center gap-1.5 hover:text-foreground transition-colors">
+              <Sparkles className="h-3 w-3" />
+              Custom System Prompt (Optional)
+            </summary>
+            <div className="mt-3">
+              <textarea
+                value={form.system_prompt}
+                onChange={(e) => setForm((f) => ({ ...f, system_prompt: e.target.value }))}
+                placeholder="Override the default MedBot system prompt for this module. Leave empty to use the default prompt."
+                rows={4}
+                className="w-full px-4 py-2.5 rounded-xl border border-border bg-background text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary resize-none transition-shadow"
+              />
+              <p className="text-[10px] text-muted-foreground mt-1">
+                Include <code className="px-1 py-0.5 bg-muted rounded text-[10px]">{'{rag_context}'}</code> in your prompt to inject retrieved context.
+              </p>
+            </div>
+          </details>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border">
+          <Button
+            variant="ghost"
+            onClick={() => { setShowCreateForm(false); setEditingModule(null); setForm(DEFAULT_FORM); }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={editingModule ? handleUpdateModule : handleCreateModule}
+            disabled={saving || !form.name.trim()}
+          >
+            {saving ? (
+              <>
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                Saving…
+              </>
+            ) : editingModule ? (
+              'Update Module'
+            ) : (
+              'Create Module'
+            )}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── Module List View ───────────────────────────────────────────────────
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      {formView}
+
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center gap-2.5">
+            <span className="inline-flex w-9 h-9 rounded-xl bg-primary/10 items-center justify-center">
+              <Cpu className="h-4.5 w-4.5 text-primary" />
+            </span>
+            RAG Studio
+          </h1>
+          <p className="text-sm text-muted-foreground mt-1 ml-[44px]">
+            Create knowledge modules that users can activate in MedBot with <code className="px-1.5 py-0.5 rounded-md bg-muted text-primary font-mono text-xs">@module_name</code>
+          </p>
+        </div>
+
+        <Button
+          variant="primary"
+          onClick={() => { setShowCreateForm(true); setForm(DEFAULT_FORM); }}
+        >
+          <Plus className="mr-1.5 h-4 w-4" />
+          New Module
+        </Button>
+      </div>
+
+      {/* Module Grid */}
+      {loading ? (
+        <div className="flex items-center justify-center py-24">
+          <Loader2 className="h-6 w-6 animate-spin text-primary" />
+        </div>
+      ) : modules.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-32 text-center rounded-2xl border border-dashed border-border bg-card/50">
+          <div className="w-14 h-14 rounded-full bg-muted flex items-center justify-center mb-4">
+            <Database className="h-6 w-6 text-muted-foreground opacity-60" />
+          </div>
+          <p className="font-semibold text-foreground">No knowledge modules yet</p>
+          <p className="text-sm text-muted-foreground mt-1 max-w-sm">
+            Create a module, upload PDFs, and your users will be able to scope MedBot's knowledge by typing <strong>@module_name</strong> in chat.
+          </p>
+          <Button
+            variant="primary"
+            className="mt-6"
+            onClick={() => { setShowCreateForm(true); setForm(DEFAULT_FORM); }}
+          >
+            <Plus className="mr-1.5 h-4 w-4" />
+            Create First Module
+          </Button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {modules.map((mod) => (
+            <div
+              key={mod.id}
+              onClick={() => setSelectedModule(mod)}
+              className="group cursor-pointer rounded-2xl border border-border bg-card p-5 hover:-translate-y-0.5 hover:shadow-elevated transition-all"
+            >
+              {/* Module header */}
+              <div className="flex items-start justify-between mb-4">
+                <div
+                  className="w-11 h-11 rounded-xl flex items-center justify-center text-lg transition-transform group-hover:scale-110"
+                  style={{ background: `${mod.color}15` }}
+                >
+                  {mod.icon}
+                </div>
+                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); startEdit(mod); }}
+                    className="h-7 w-7 rounded-lg hover:bg-muted flex items-center justify-center text-muted-foreground hover:text-foreground"
+                    title="Edit"
+                  >
+                    <Edit2 className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleDeleteModule(mod); }}
+                    className="h-7 w-7 rounded-lg hover:bg-destructive/10 flex items-center justify-center text-destructive"
+                    title="Delete"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Name + slug */}
+              <h3 className="font-bold text-foreground text-base">{mod.name}</h3>
+              <p className="text-xs font-mono mt-0.5" style={{ color: mod.color }}>@{mod.slug}</p>
+
+              {/* Description */}
+              {mod.description && (
+                <p className="text-xs text-muted-foreground mt-2 line-clamp-2">{mod.description}</p>
+              )}
+
+              {/* Stats */}
+              <div className="flex items-center gap-3 mt-4 pt-4 border-t border-border">
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <FileText className="h-3 w-3" />
+                  <span>{mod.document_count} docs</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Database className="h-3 w-3" />
+                  <span>{mod.chunk_count} chunks</span>
+                </div>
+                <div className={cn(
+                  'ml-auto flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full',
+                  mod.is_active
+                    ? 'bg-emerald-500/10 text-emerald-500'
+                    : 'bg-muted text-muted-foreground'
+                )}>
+                  <span className={cn('w-1.5 h-1.5 rounded-full', mod.is_active ? 'bg-emerald-500' : 'bg-muted-foreground')} />
+                  {mod.is_active ? 'Active' : 'Inactive'}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};

@@ -1,0 +1,350 @@
+"""
+RAG Studio Admin Router.
+
+Full CRUD for RAG modules and their documents:
+- Module management (create, list, update, delete)
+- Document upload and management within modules
+- PDF processing pipeline integration
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from beanie import PydanticObjectId
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from app.core.deps import require_role, UserRole
+
+def RoleGuard(roles: List[str]):
+    return require_role(UserRole.ADMIN)
+
+from app.integrations.r2 import upload_file_to_r2, delete_files_from_r2_by_urls
+from app.models.rag import PDFDocument, RAGModule, TextEmbedding
+from app.models.user import User
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/admin/rag-studio", tags=["admin-rag-studio"])
+
+
+# ── Schemas ──────────────────────────────────────────────────────────────────
+
+
+class ModuleCreate(BaseModel):
+    name: str
+    slug: str
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+    icon: str = "Book"
+    color: str = "#7132F5"
+
+
+class ModuleUpdate(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _slugify(text: str) -> str:
+    """Convert text to a valid slug for @mentions."""
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s_-]", "", text)
+    text = re.sub(r"[\s-]+", "_", text)
+    return text
+
+
+def _secure_filename(filename: str) -> str:
+    """Sanitize a filename for safe storage."""
+    filename = os.path.basename(filename)
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
+
+
+# ── Module CRUD ──────────────────────────────────────────────────────────────
+
+
+@router.get("/modules")
+async def list_modules(admin: User = Depends(RoleGuard(["admin"]))):
+    """List all RAG modules with their stats."""
+    modules = await RAGModule.find().sort("-updated_at").to_list()
+    return [
+        {
+            "id": str(m.id),
+            "name": m.name,
+            "slug": m.slug,
+            "description": m.description,
+            "system_prompt": m.system_prompt,
+            "icon": m.icon,
+            "color": m.color,
+            "is_active": m.is_active,
+            "document_count": m.document_count,
+            "chunk_count": m.chunk_count,
+            "created_at": m.created_at.isoformat(),
+            "updated_at": m.updated_at.isoformat(),
+        }
+        for m in modules
+    ]
+
+
+@router.post("/modules", status_code=201)
+async def create_module(
+    data: ModuleCreate,
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """Create a new RAG module."""
+    slug = _slugify(data.slug) if data.slug else _slugify(data.name)
+
+    # Check uniqueness
+    existing = await RAGModule.find_one(RAGModule.slug == slug)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A module with slug '{slug}' already exists.",
+        )
+
+    now = datetime.now(timezone.utc)
+    module = RAGModule(
+        name=data.name,
+        slug=slug,
+        description=data.description,
+        system_prompt=data.system_prompt,
+        icon=data.icon,
+        color=data.color,
+        created_by=admin.id,
+        created_at=now,
+        updated_at=now,
+    )
+    await module.insert()
+
+    return {"id": str(module.id), "slug": module.slug, "message": "Module created"}
+
+
+@router.patch("/modules/{module_id}")
+async def update_module(
+    module_id: str,
+    data: ModuleUpdate,
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """Update a RAG module's metadata."""
+    try:
+        mid = PydanticObjectId(module_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid module ID format")
+
+    module = await RAGModule.get(mid)
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    if data.name is not None:
+        module.name = data.name
+    if data.slug is not None:
+        new_slug = _slugify(data.slug)
+        # Check uniqueness (exclude self)
+        existing = await RAGModule.find_one(
+            RAGModule.slug == new_slug, RAGModule.id != mid
+        )
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A module with slug '{new_slug}' already exists.",
+            )
+        module.slug = new_slug
+    if data.description is not None:
+        module.description = data.description
+    if data.system_prompt is not None:
+        module.system_prompt = data.system_prompt
+    if data.icon is not None:
+        module.icon = data.icon
+    if data.color is not None:
+        module.color = data.color
+    if data.is_active is not None:
+        module.is_active = data.is_active
+
+    module.updated_at = datetime.now(timezone.utc)
+    await module.save()
+
+    return {"message": "Module updated successfully"}
+
+
+@router.delete("/modules/{module_id}")
+async def delete_module(
+    module_id: str,
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """Delete a module and all its associated documents and embeddings."""
+    try:
+        mid = PydanticObjectId(module_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid module ID format")
+
+    module = await RAGModule.get(mid)
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    # Delete all embeddings for this module
+    await TextEmbedding.find(TextEmbedding.module_id == mid).delete()
+
+    # Delete all PDF documents for this module
+    docs = await PDFDocument.find(PDFDocument.module_id == mid).to_list()
+    for doc in docs:
+        await doc.delete()
+
+    # Delete the module itself
+    await module.delete()
+
+    return {"message": "Module and all associated data deleted successfully"}
+
+
+# ── Document Management ─────────────────────────────────────────────────────
+
+
+@router.get("/modules/{module_id}/documents")
+async def list_module_documents(
+    module_id: str,
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """List all documents in a module."""
+    try:
+        mid = PydanticObjectId(module_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid module ID format")
+
+    docs = await PDFDocument.find(PDFDocument.module_id == mid).sort("-created_at").to_list()
+    return [
+        {
+            "id": str(d.id),
+            "module_id": str(d.module_id) if d.module_id else None,
+            "filename": d.filename,
+            "status": d.status,
+            "page_count": d.page_count,
+            "chunk_count": d.chunk_count,
+            "error_message": d.error_message,
+            "created_at": d.created_at.isoformat(),
+        }
+        for d in docs
+    ]
+
+
+@router.post("/modules/{module_id}/documents", status_code=201)
+async def upload_document(
+    module_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """Upload a PDF to a specific module and trigger processing."""
+    try:
+        mid = PydanticObjectId(module_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid module ID format")
+
+    module = await RAGModule.get(mid)
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf") or file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    # Read file into memory
+    file_bytes = await file.read()
+    if len(file_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 50MB.")
+
+    # Upload to R2 storage
+    safe_name = _secure_filename(file.filename)
+    r2_filename = f"rag/{module.slug}/{PydanticObjectId()}_{safe_name}"
+
+    try:
+        public_url = await asyncio.to_thread(upload_file_to_r2, file_bytes, r2_filename)
+    except Exception as exc:
+        logger.error("R2 upload failed: %s", exc)
+        # Still create the document record — process from memory
+        public_url = f"local://{r2_filename}"
+
+    # Create PDF document record
+    pdf_doc = PDFDocument(
+        filename=safe_name,
+        r2_key=r2_filename,
+        uploaded_by=admin.id,
+        module_id=mid,
+        status="processing",
+    )
+    await pdf_doc.insert()
+
+    # Process PDF in background (extract → chunk → embed → store)
+    async def _background_process():
+        try:
+            from app.services.pdf_pipeline import process_pdf
+            await process_pdf(file_bytes, pdf_doc, mid)
+        except Exception as exc:
+            logger.error("Background PDF processing failed: %s", exc)
+            pdf_doc.status = "failed"
+            pdf_doc.error_message = str(exc)[:500]
+            await pdf_doc.save()
+
+    background_tasks.add_task(_background_process)
+
+    return {
+        "id": str(pdf_doc.id),
+        "message": "PDF uploaded and processing started",
+    }
+
+
+@router.delete("/modules/{module_id}/documents/{doc_id}")
+async def delete_document(
+    module_id: str,
+    doc_id: str,
+    admin: User = Depends(RoleGuard(["admin"])),
+):
+    """Delete a document and its embeddings from a module."""
+    try:
+        mid = PydanticObjectId(module_id)
+        did = PydanticObjectId(doc_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    doc = await PDFDocument.get(did)
+    if not doc or doc.module_id != mid:
+        raise HTTPException(status_code=404, detail="Document not found in this module")
+
+    # Delete embeddings for this document
+    await TextEmbedding.find(TextEmbedding.pdf_id == did).delete()
+
+    # Delete from R2 if applicable
+    if doc.r2_key and not doc.r2_key.startswith("local://"):
+        try:
+            from app.core.config import settings
+            r2_url = f"{settings.R2_PUBLIC_URL}/{doc.r2_key}"
+            await asyncio.to_thread(delete_files_from_r2_by_urls, [r2_url])
+        except Exception as exc:
+            logger.warning("R2 delete failed (non-fatal): %s", exc)
+
+    await doc.delete()
+
+    # Update module counters
+    module = await RAGModule.get(mid)
+    if module:
+        module.chunk_count = await TextEmbedding.find(
+            TextEmbedding.module_id == mid
+        ).count()
+        module.document_count = await PDFDocument.find(
+            PDFDocument.module_id == mid,
+            PDFDocument.status == "ready",
+        ).count()
+        module.updated_at = datetime.now(timezone.utc)
+        await module.save()
+
+    return {"message": "Document and embeddings deleted successfully"}
